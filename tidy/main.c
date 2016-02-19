@@ -130,44 +130,43 @@ mtime_long(char* mtime_str)
 
 /* Let's loop */
 int
-loopy(time_t then, char *path, struct node *root, struct node *current, struct node **last)
+loopy(time_t then, char *unfiltered_path, struct node *root, struct node *current, struct node **last)
 {
     /* removed is the number of files & directories deleted */
     int removed = 0;
     int ret;
     int newsize;
     int nuked = 0;
-    char resolvedname[PATH_MAX + 1];
+    char path[PATH_MAX + 1];
     char perror_str[TIDY_PERROR_BUF_LEN + 1];
-    char *newpath;
-    char *newpath2;
-    char *resolvedname_folder;
+    char *unflitered_item;
+    char *unfiltered_item2;
+    char *item;
     struct node *node;
     struct dirent *dirent;
     struct stat *buf;
     DIR *dir;
     
-    realpath(path, resolvedname);
+    realpath(unfiltered_path, path);
 
     if (root == NULL) {
         /* No Root - must be the first try */
 
-        new_node(&node, resolvedname);
+        new_node(&node, path);
         root = node;
         current = root;
     } else {
         if (current == NULL) {
-            fprintf(stderr, "This can't be right I have a root, but no current node %s\n", resolvedname);
+            fprintf(stderr, "This can't be right I have a root, but no current node %s\n", path);
             return( removed );
         }
-        if (path_already_read(root, resolvedname)) {
-            fprintf(stderr, "Been here before. ignoring %s\n", resolvedname);
+        if (path_already_read(root, path)) {
+            fprintf(stderr, "Been here before. ignoring %s\n", path);
             return( removed );
         }
         
-        /* always add the path into visited - doesn't matter if it's valid,
-         or we can't chdir into it or not */
-        add_node(&node, current, resolvedname);
+        /* always add the path into visited - doesn't matter if it's valid or perms issues */
+        add_node(&node, current, path);
         current = node;
     }
     
@@ -177,15 +176,18 @@ loopy(time_t then, char *path, struct node *root, struct node *current, struct n
     }
 
     /* current is at the end, so set *last to it */
+    
+    *last = current;
+    
+    /* open folder */
 
-    dir = opendir(resolvedname);
+    dir = opendir(path);
     
     if ( dir == NULL ) {
-        snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "can't open dir %s - ignoring\n", resolvedname);
+        snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "Can't open dir %s - ignoring\n", path);
         perror(perror_str);
         return(0);
     }
-    *last = current;
 
     while ((dirent = readdir(dir)) != NULL) {
         if (( strcmp(dirent->d_name, TIDY_HERE_DIR) == 0 ) || (strcmp(dirent->d_name, TIDY_PARENT_DIR) == 0)) {
@@ -193,14 +195,14 @@ loopy(time_t then, char *path, struct node *root, struct node *current, struct n
         }
         fprintf(stderr, "dirent: %s\n", dirent->d_name);
 
-        newsize = (int)(strlen(resolvedname) + strlen(TIDY_PATH_SEPARATOR) + strlen(dirent->d_name));
-        fprintf(stderr, "%d, %lu, %lu, %lu\n", newsize, strlen(resolvedname), strlen(TIDY_PATH_SEPARATOR) ,strlen(dirent->d_name)  );
+        newsize = (int)(strlen(path) + strlen(TIDY_PATH_SEPARATOR) + strlen(dirent->d_name));
+        fprintf(stderr, "%d, %lu, %lu, %lu\n", newsize, strlen(path), strlen(TIDY_PATH_SEPARATOR) ,strlen(dirent->d_name)  );
 
-        newpath = calloc(newsize + 1, sizeof(char));
-        newpath2 = calloc(newsize + 1, sizeof(char));
+        unflitered_item = calloc(newsize + 1, sizeof(char));
+        unfiltered_item2 = calloc(newsize + 1, sizeof(char));
         /* Lazy. strncpy/strncat and friends bust my chops */
          
-        snprintf(newpath2, newsize + 1,  "%s%s%s",resolvedname, TIDY_PATH_SEPARATOR,dirent->d_name);
+        snprintf(unfiltered_item2, newsize + 1,  "%s%s%s",path, TIDY_PATH_SEPARATOR,dirent->d_name);
         
         /*
          strncpy (newpath, path, strlen(path));
@@ -208,13 +210,13 @@ loopy(time_t then, char *path, struct node *root, struct node *current, struct n
          strncat (newpath, dirent->d_name, strlen(dirent->d_name));
          fprintf(stderr, "newpath:  %s\n", newpath);
          */
-        fprintf(stderr, "newpath2: %s\n", newpath2);
+        fprintf(stderr, "newpath2: %s\n", unfiltered_item2);
         
-        resolvedname_folder = realpath(newpath2, NULL);
+        item = realpath(unfiltered_item2, NULL);
         
         buf = malloc (sizeof(struct stat));
 
-        ret = lstat(resolvedname_folder, buf);
+        ret = lstat(item, buf);
         if (ret != 0) {
             snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "can't stat %s - ignoring\n", dirent->d_name);
             perror(perror_str);
@@ -230,18 +232,18 @@ loopy(time_t then, char *path, struct node *root, struct node *current, struct n
         
         if (S_ISDIR(buf->st_mode)) {
 
-            fprintf(stderr, "Looping with rn: %s\n", resolvedname_folder);
+            fprintf(stderr, "Looping with item: %s\n", item);
             fprintf(stderr, "pre  loop:\t%s\tlast:\t%s\n", current->path, (*last)->path);
             
-            nuked += loopy(then, resolvedname_folder, root, current, last);
+            nuked += loopy(then, item, root, current, last);
             
             fprintf(stderr, "post loop:\t%s\tlast:\t%s\n", current->path, (*last)->path);
             
             /* Attempt to remove it. It may be empty. Ignore errors. Don't care */
-            rmdir(resolvedname_folder);
+            rmdir(item);
         } else if (S_ISREG(buf->st_mode) && ( difftime(then, buf->st_mtime) >0 )) {
             /* NUKE IT */
-            fprintf(stderr,"REMOVE %s\n", resolvedname_folder);
+            fprintf(stderr,"REMOVE %s\n", item);
             /*
              if (unlink(resolvedname) == 0) {
              ++nuked;
@@ -253,6 +255,12 @@ loopy(time_t then, char *path, struct node *root, struct node *current, struct n
         }
         free(buf);
     }
+    ret = closedir(dir);
+    if ( ret != 0 ) {
+        snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "Failed to close dir %s - ignoring\n", path);
+        perror(perror_str);
+    }
+    
     return nuked;
 }
 
@@ -312,7 +320,7 @@ path_already_read(struct node *root, char *path)
     node = root;
     
     while (node != NULL) {
-        fprintf(stderr, "node: %s\n", node->path);
+        /* fprintf(stderr, "node: %s\n", node->path); */
         if (strcmp(node->path, path) == 0) {
             return(true);
         }
