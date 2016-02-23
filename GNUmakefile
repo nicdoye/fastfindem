@@ -35,7 +35,7 @@ RM = rm -f
 CP = cp -f
 INSTALL = install
 
-BINARY = tidy
+BINARY = fastfindem
 TARGET = ${bindir}/${BINARY}
 
 INSTALLBINARY = ${INSTALL} -m 0755 ${TARGET} ${installdir}
