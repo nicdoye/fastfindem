@@ -17,43 +17,61 @@
 #include <stdbool.h>
 #include <string.h>
 
-#define TIDY_MTIME_BASE      10
-#define TIDY_SECONDS_PER_DAY 60 * 60 * 24
-#define TIDY_HERE_DIR        "."
-#define TIDY_PARENT_DIR      ".."
-#define TIDY_PATH_SEPARATOR  "/"
-#define TIDY_PERROR_BUF_LEN  80
-#define TIDY_DEBUG
+#define _T_MTIME_BASE           10
+#define _T_SECONDS_PER_DAY      60 * 60 * 24
+#define _T_DOT                  "."
+#define _T_DOT_DOT              ".."
+#define _T_PATH_SEPARATOR       "/"
+/* Saves calculating it every time */
+#define _T_PATH_SEPARATOR_LEN   1
+#define _T_PERROR_BUF_LEN       80
 
-/* Linked List - not the fastest, but q+d to implement*/
+/* Optionals
+#define _T_DEBUG
+#define _T_DRY_RUN
+ */
+
+/* 
+ * Linked List - not the fastest O(n^2)!, but q+d to implement
+ *
+ * If we traverse n directories (including the root directory)
+ * There are sum (1 .. (n -1)) checks = (n - 1)(n/2) = (n^2 - n)/2
+ * For 30 folders that's 435 comparisons. Gulp.
+ * 
+ * We cache path_len to stop future strlen()s
+ */
 struct node {
-    char        *path;
-    struct node *next;
+    char            *path;
+    unsigned long   path_len;
+    struct node     *next;
 };
 
 
 extern char **environ;
 
-int loopy(time_t, char*, struct node*, struct node*, struct node**);
+void tidy_dir(int *, time_t, char*, struct node **);
+void tidy_item(int *, time_t, char *, struct node *, struct node **);
 long mtime_long(char*);
-bool path_already_read(struct node *, char *);
 time_t then_time(long mtime);
 
-void new_node_empty(struct node **);
-void new_node(struct node **, char *);
-void add_node(struct node **, struct node *, char *);
+bool add_node(struct node *, struct node *);
+void node_init(struct node **, char *);
+void check_malloc(void *);
+void free_node(struct node **);
+void free_nodes(struct node *);
+void canonicalise_item(char *, struct node *, char **);
 
-int main
-(int argc, char *argv[])
+int
+main(int argc, char *argv[])
 {
-    int total;
+    int removed = 0;
     char *mtime_str;
     char *path;
     long mtime;
     time_t then;
-    struct node **last;
+    struct node **root_node_p;
     
-#ifdef TIDY_DEBUG
+#ifdef _T_DEBUG
     setvbuf(stderr, NULL, _IONBF, 0);
 #endif
     
@@ -68,21 +86,247 @@ int main
     /* Calculate the number of days based on input */
     mtime = mtime_long(mtime_str);
     then  = then_time(mtime);
-    last = malloc(sizeof(struct node *));
     
-    total = loopy(then, path, NULL, NULL, last);
+    root_node_p = malloc(sizeof(struct node *));
+    check_malloc((void *) root_node_p);
+    *root_node_p = NULL;
     
-    fprintf(stderr, "%d files deleted\n", total);
+    tidy_dir(&removed, then, path, root_node_p);
+    
+    free_nodes(*root_node_p);
+    free(root_node_p);
+    
+    fprintf(stderr, "%d files deleted\n", removed);
     exit(EXIT_SUCCESS);
 }
 
+/*
+ * Returns number of items removed
+ */
+void
+tidy_item(int *removed_p, time_t then, char *item_name, struct node *this_node, struct node **root_node_p)
+{
+    char        *item;
+    char        perror_str[_T_PERROR_BUF_LEN + 1];
+    struct stat *buf;
+    int         ret;
+    
+    if (( strcmp(item_name, _T_DOT) == 0 ) || (strcmp(item_name, _T_DOT_DOT) == 0)) {
+        return;
+    }
+    
+    canonicalise_item(item_name, this_node, &item);
+
+    buf = malloc (sizeof(struct stat));
+    check_malloc((void *) buf);
+   
+    ret = lstat(item, buf);
+    if (ret != 0) {
+        fprintf(stderr, "can't stat '%s' - ignoring\n", item);
+        free(item);
+        free(buf);
+        return;
+    }
+    
+    if (S_ISDIR(buf->st_mode)) {
+        tidy_dir(removed_p, then, item, root_node_p);
+        rmdir(item);
+    } else if (S_ISREG(buf->st_mode) && ( difftime(then, buf->st_mtime) >0 )) {
+        
+#ifdef _T_DRY_RUN
+        fprintf(stderr,"REMOVE %s\n", item);
+        ++(*removed_p);
+#else
+
+        if (unlink(item) == 0) {
+            ++(*removed_p);
+        } else {
+            snprintf(perror_str, (size_t)_T_PERROR_BUF_LEN, "Couldn't remove %s\n", item);
+            perror(perror_str);
+        }
+#endif
+    }
+
+    free(buf);
+    free(item);
+}
+
+/* Let's loop */
+void
+tidy_dir(int *removed_p, time_t then, char *non_canonicalised_path, struct node **root_node_p)
+{
+    int ret;
+    char path[PATH_MAX + 1];
+    char perror_str[_T_PERROR_BUF_LEN + 1];
+    bool new_folder = true;
+    struct node *this_node;
+    struct dirent *dirent;
+    DIR *dir;
+    
+    /* Get canonical path */
+    realpath(non_canonicalised_path, path);
+
+    this_node = malloc(sizeof(struct node));
+    check_malloc((void *) this_node);
+    node_init(&this_node, path);
+    
+    if (*root_node_p == NULL) {
+        /* First pass root is null */
+        *root_node_p = this_node;
+    } else {
+        /* New Node to be added */
+        new_folder = add_node(*root_node_p, this_node);
+        
+        if ( !new_folder ) {
+            fprintf(stderr, "Been here before. ignoring %s\n", path);
+            free_node(&this_node);
+            return;
+        }
+    }
+    
+    /* Open the directory */
+    dir = opendir(path);
+    
+    if ( NULL == dir ) {
+        snprintf(perror_str, (size_t)_T_PERROR_BUF_LEN, "Can't open dir %s - ignoring\n", path);
+        perror(perror_str);
+        return;
+    }
+    
+    /*
+     * Actual looping across directory part
+     */
+    while (NULL != (dirent = readdir(dir))) {
+        tidy_item(removed_p, then, dirent->d_name, this_node, root_node_p);
+    }
+  
+    /* close directory */
+    ret = closedir(dir);
+    
+    if ( ret != 0 ) {
+        snprintf(perror_str, (size_t)_T_PERROR_BUF_LEN, "Failed to close dir %s - ignoring\n", path);
+        perror(perror_str);
+    }
+}
+
+/*
+ * Walk to the end and add the new_node.
+ * Returns true iff it appends the node.
+ * Returns false if it found the path already.
+ */
+bool
+add_node(struct node *root_node, struct node *new_node)
+{
+    struct node *this_node = NULL;
+    struct node *head_node;
+    
+    if (NULL == root_node) {
+        fprintf(stderr, "Can't walk along an empty list. Returning false, but could be broken\n");
+        return(false);
+    }
+    
+    /* Check if this path has already been added */
+    
+    head_node = root_node;
+    while (NULL != head_node) {
+        this_node = head_node;
+        head_node = head_node->next;
+
+        /* path_len check may help, but if you have a folder */
+
+        if ( this_node->path_len == new_node->path_len &&
+            strcmp(this_node->path, new_node->path) == 0) {
+            /*
+             * The new node matches the current iterator node.
+             * containing e.g. timestamp folders it's an extra
+             * (although quick) test
+             */
+            return(false);
+        }
+    }
+    if (NULL == this_node) {
+        /* This is purely here to stop Xcode moaning */
+        fprintf(stderr, "this_node is NULL. Bailing\n");
+        
+        return false;
+    }
+    this_node->next = new_node;
+
+    return(true);
+}
+
+/*
+ * Walk along the list. Freeing them all
+ */
+void
+free_nodes(struct node *root_node)
+{
+    struct node *this_node;
+    struct node *head_node;
+    
+    if (NULL == root_node) {
+        fprintf(stderr, "Can't walk along an empty list. Returning false, but could be broken\n");
+        return;
+    }
+    
+    head_node = root_node;
+    while (NULL != head_node) {
+        this_node = head_node;
+        head_node = head_node->next;
+        free_node(&this_node);
+    }
+}
+
+void
+free_node(struct node **node)
+{
+    free((*node)->path);
+    free(*node);
+}
+
+/*
+ * Set up values for node
+ */
+void
+node_init(struct node **node_p, char *path)
+{
+    if (NULL == node_p) {
+        fprintf(stderr, "Nonsensical for node_p to be NULL. Bailing\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    (*node_p)->path = strdup(path);
+    (*node_p)->path_len = strlen(path);
+    (*node_p)->next = NULL;
+}
+
+/*
+ * General Utility functions
+ */
+
+/* 
+ * No point carrying on in all cases 
+ */
+void
+check_malloc(void * p)
+{
+    if (NULL == p) {
+        fprintf(stderr, "Out of memory. Bailing\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+/* 
+ * Given a number of days (mtime) 
+ * return the time_t of this exact time minus that number of days
+ */
 time_t
 then_time(long mtime)
 {
     time_t        now;
     
     /* Convert it to seconds */
-    mtime *= TIDY_SECONDS_PER_DAY;
+    mtime *= _T_SECONDS_PER_DAY;
     
     if (mtime > INT_MAX) {
         fprintf(stderr, "Whoa cowboy %ld is a lot of seconds. Baiing\n", mtime);
@@ -98,18 +342,24 @@ then_time(long mtime)
     return(now - (int) mtime);
 }
 
+/* 
+ * Given a time string, turn it into a long
+ * This code is pretty much the example given in man strtol(3)
+ */
 long
 mtime_long(char* mtime_str)
 {
-    char    *endptr,
-            perror_str[TIDY_PERROR_BUF_LEN + 1];
-    long    mtime = strtol(mtime_str, &endptr, TIDY_MTIME_BASE);
+    char    *endptr;
+    char    perror_str[_T_PERROR_BUF_LEN + 1];
+    
+    /* Convert the number in mtime_str into a long. Place in mtime */
+    long    mtime = strtol(mtime_str, &endptr, _T_MTIME_BASE);
     
     /* Check for various possible errors */
     
     if ((errno == ERANGE && (mtime == LONG_MAX || mtime == LONG_MIN))
         || (errno != 0 && mtime == 0)) {
-        snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "couldn't convert %s to a long\n", mtime_str);
+        snprintf(perror_str, (size_t)_T_PERROR_BUF_LEN, "couldn't convert %s to a long\n", mtime_str);
         perror(perror_str);
         exit(EXIT_FAILURE);
     }
@@ -128,203 +378,35 @@ mtime_long(char* mtime_str)
     return(labs(mtime));
 }
 
-/* Let's loop */
-int
-loopy(time_t then, char *unfiltered_path, struct node *root, struct node *current, struct node **last)
-{
-    /* removed is the number of files & directories deleted */
-    int removed = 0;
-    int ret;
-    int newsize;
-    int nuked = 0;
-    char path[PATH_MAX + 1];
-    char perror_str[TIDY_PERROR_BUF_LEN + 1];
-    char *unflitered_item;
-    char *unfiltered_item2;
-    char *item;
-    struct node *node;
-    struct dirent *dirent;
-    struct stat *buf;
-    DIR *dir;
-    
-    realpath(unfiltered_path, path);
-
-    if (root == NULL) {
-        /* No Root - must be the first try */
-
-        new_node(&node, path);
-        root = node;
-        current = root;
-    } else {
-        if (current == NULL) {
-            fprintf(stderr, "This can't be right I have a root, but no current node %s\n", path);
-            return( removed );
-        }
-        if (path_already_read(root, path)) {
-            fprintf(stderr, "Been here before. ignoring %s\n", path);
-            return( removed );
-        }
-        
-        /* always add the path into visited - doesn't matter if it's valid or perms issues */
-        add_node(&node, current, path);
-        current = node;
-    }
-    
-    if (last == NULL) {
-        fprintf(stderr, "Nonsensical for last not to be set. Bailing\n");
-        exit(EXIT_FAILURE);
-    }
-
-    /* current is at the end, so set *last to it */
-    
-    *last = current;
-    
-    /* open folder */
-
-    dir = opendir(path);
-    
-    if ( dir == NULL ) {
-        snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "Can't open dir %s - ignoring\n", path);
-        perror(perror_str);
-        return(0);
-    }
-
-    while ((dirent = readdir(dir)) != NULL) {
-        if (( strcmp(dirent->d_name, TIDY_HERE_DIR) == 0 ) || (strcmp(dirent->d_name, TIDY_PARENT_DIR) == 0)) {
-            continue;
-        }
-        fprintf(stderr, "dirent: %s\n", dirent->d_name);
-
-        newsize = (int)(strlen(path) + strlen(TIDY_PATH_SEPARATOR) + strlen(dirent->d_name));
-        fprintf(stderr, "%d, %lu, %lu, %lu\n", newsize, strlen(path), strlen(TIDY_PATH_SEPARATOR) ,strlen(dirent->d_name)  );
-
-        unflitered_item = calloc(newsize + 1, sizeof(char));
-        unfiltered_item2 = calloc(newsize + 1, sizeof(char));
-        /* Lazy. strncpy/strncat and friends bust my chops */
-         
-        snprintf(unfiltered_item2, newsize + 1,  "%s%s%s",path, TIDY_PATH_SEPARATOR,dirent->d_name);
-        
-        /*
-         strncpy (newpath, path, strlen(path));
-         strncat (newpath, TIDY_PATH_SEPARATOR, (strlen(TIDY_PATH_SEPARATOR)));
-         strncat (newpath, dirent->d_name, strlen(dirent->d_name));
-         fprintf(stderr, "newpath:  %s\n", newpath);
-         */
-        fprintf(stderr, "newpath2: %s\n", unfiltered_item2);
-        
-        item = realpath(unfiltered_item2, NULL);
-        
-        buf = malloc (sizeof(struct stat));
-
-        ret = lstat(item, buf);
-        if (ret != 0) {
-            snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "can't stat %s - ignoring\n", dirent->d_name);
-            perror(perror_str);
-            free(buf);
-            continue;
-        }
-        
-        if (newsize - 1 >= PATH_MAX) {
-            fprintf(stderr, "Path length too long: %d - ignoring\n", newsize);
-            free(buf);
-            continue;
-        }
-        
-        if (S_ISDIR(buf->st_mode)) {
-
-            fprintf(stderr, "Looping with item: %s\n", item);
-            fprintf(stderr, "pre  loop:\t%s\tlast:\t%s\n", current->path, (*last)->path);
-            
-            nuked += loopy(then, item, root, current, last);
-            
-            fprintf(stderr, "post loop:\t%s\tlast:\t%s\n", current->path, (*last)->path);
-            
-            /* Attempt to remove it. It may be empty. Ignore errors. Don't care */
-            rmdir(item);
-        } else if (S_ISREG(buf->st_mode) && ( difftime(then, buf->st_mtime) >0 )) {
-            /* NUKE IT */
-            fprintf(stderr,"REMOVE %s\n", item);
-            /*
-             if (unlink(resolvedname) == 0) {
-             ++nuked;
-             } else {
-             snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "Couldn't remove %s\n", resolvedname);
-             perror(perror_str);
-             }
-             */
-        }
-        free(buf);
-    }
-    ret = closedir(dir);
-    if ( ret != 0 ) {
-        snprintf(perror_str, (size_t)TIDY_PERROR_BUF_LEN, "Failed to close dir %s - ignoring\n", path);
-        perror(perror_str);
-    }
-    
-    return nuked;
-}
-
-/* Returns added node */
+/*
+ * Convert path/item_name to canonical name and place in item.
+ */
 void
-add_node(struct node **node_ptr, struct node *current, char *path)
+canonicalise_item(char *item_name, struct node *this_node, char **item_p)
 {
-    struct node *node;
+    int     newsize;
+    char    *non_canonicalised_item;
+    char    item[PATH_MAX + 1];
     
-    if (current->next != NULL) {
-        fprintf(stderr, "Adding a new node, but wasn't at the end\n");
-        exit(EXIT_FAILURE);
-    }
+    unsigned long item_name_len = strlen(item_name);
+    newsize = (int)(this_node->path_len + _T_PATH_SEPARATOR_LEN + item_name_len + 1);
     
-    new_node(&node, path);
-    *node_ptr = node;
-    current->next = *node_ptr;
+    non_canonicalised_item = malloc(sizeof(char) * (newsize)); /*  calloc(newsize + 1, sizeof(char)); */
+    check_malloc((void *) non_canonicalised_item);
+
+    /*
+     * Given we've just allocated the correct amount of data
+     * and that strcpy is meant to be faster than strncpy etc.
+     * I'm using the good, old-fashioned versions of strcpy and strcat
+     */
+    
+    strcpy (non_canonicalised_item, this_node->path);
+    strcat (non_canonicalised_item, _T_PATH_SEPARATOR);
+    strcat (non_canonicalised_item, item_name);
+
+    realpath(non_canonicalised_item, item);
+    *item_p = strdup(item);
+    
+    free(non_canonicalised_item);
 }
 
-void
-new_node(struct node **node_ptr, char *path)
-{
-    struct node *node;
-    node = malloc(sizeof(struct node));
-    
-    new_node_empty(&node);
-    *node_ptr = node;
-    (*node_ptr)->path = path;
-}
-
-void
-new_node_empty(struct node **node_ptr)
-{
-    if (node_ptr == NULL) {
-        fprintf(stderr, "Nonsensical for node_ptr to be NULL. Bailing\n");
-        exit(EXIT_FAILURE);
-    }
-    
-    if ( *node_ptr == NULL ) {
-        (*node_ptr) = malloc(sizeof(struct node));
-    }
-    
-    if ( *node_ptr == NULL ) {
-        fprintf(stderr, "Couldn't get memory for new node\n");
-        exit(EXIT_FAILURE);
-    }
-    
-    (*node_ptr)->next  = NULL;
-}
-
-bool
-path_already_read(struct node *root, char *path)
-{
-    struct node *node;
-    
-    /* start at root of list and walk along it */
-    node = root;
-    
-    while (node != NULL) {
-        /* fprintf(stderr, "node: %s\n", node->path); */
-        if (strcmp(node->path, path) == 0) {
-            return(true);
-        }
-        node = node->next;
-    }
-    return(false);
-}
