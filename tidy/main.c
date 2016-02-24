@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <string.h>
 
+#define VERSION                 0.1
 #define _T_MTIME_BASE           10
 #define _T_SECONDS_PER_DAY      60 * 60 * 24
 #define _T_DOT                  "."
