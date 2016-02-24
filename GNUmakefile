@@ -18,7 +18,10 @@ sources = tidy/main.c
 # DEFAULT: CC = cc
 GCC = gcc
 CLANG = clang
-CFLAGS = -g
+# Don't want this? Pass it through on the command line
+CFLAGS = -Ofast
+# For Xcode
+OTHER_CFLAGS = -O3
 
 # Xcode
 xcodebuild = xcodebuild
@@ -38,8 +41,6 @@ legacy_binary = tidy
 binary = fastfindem
 target = $(bindir)/$(binary)
 
-INSTALLbinary = $(INSTALL) -m 0755 $(target) $(installdir)
-
 ########################################################################
 
 all: default
@@ -51,10 +52,10 @@ gcc: $(sources)
 : $(GCC) -o $(target) $(sources) $(CFLAGS)
 
 clang: $(sources)
-: $(CLANG) -o $(target) $(sources) $(CFLAGS)
+: $(CLANG) -o $(target) $(sources) $(OTHER_CFLAGS)
 
 xcode: $(sources) $(xcodeproj)
-: $(xcodebuild) -project $(xcodeproj)
+: $(xcodebuild) -project $(xcodeproj) OTHER_CFLAGS=$(OTHER_CFLAGS)
 : $(CP) $(xcodebindir)/$(legacy_binary) $(target)
 
 infer: $(sources)
@@ -68,4 +69,4 @@ clean:
 : $(xcodebuild) clean 
 
 install: $(target)
-: $(INSTALLbinary)
+: $(INSTALL) -m 0755 $(target) $(installdir)

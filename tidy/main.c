@@ -107,7 +107,9 @@ void
 tidy_item(int *removed_p, time_t then, char *item_name, struct node *this_node, struct node **root_node_p)
 {
   char        *item;
+#ifndef _T_DRY_RUN
   char        perror_str[_T_PERROR_BUF_LEN + 1];
+#endif
   struct stat *buf;
   int         ret;
   
